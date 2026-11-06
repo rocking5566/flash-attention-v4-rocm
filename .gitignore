@@ -1,0 +1,7 @@
+.remote.env
+.codex/
+build/
+reference/
+__pycache__/
+results
+FAv4.pdf

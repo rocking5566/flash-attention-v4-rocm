@@ -1,0 +1,14 @@
+The degree-3 exp2 polynomial coefficients retained in src/bshd_kernel.hpp
+(not enabled by production dispatch) are from flash_attn/cute/utils.py,
+Copyright (c) 2025, Tri Dao, in FlashAttention revision
+2ed4a1f0fc0e36a6ca7b861bfbf86ebb82c4c592.
+Its BSD 3-Clause license is reproduced in licenses/flash-attention-BSD-3-Clause.txt.
+
+The TDM descriptor field layout in include/gfx1250.h, workgroup locality
+mapping in src/bshd_kernel.hpp, and CK comparator were adapted using AMD's
+Composable Kernel sources, Copyright (c) Advanced Micro Devices, Inc., or
+its affiliates, under the MIT license in licenses/composable-kernel-MIT.txt.
+
+The standalone HIP library has no CK or FlashAttention build/runtime dependency.
+CK is only used by the optional comparison library; PyTorch is used by the
+correctness/benchmark harness.
