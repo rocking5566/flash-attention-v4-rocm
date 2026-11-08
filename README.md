@@ -42,7 +42,7 @@ bash scripts/remote.sh bash scripts/build.sh
 ```
 
 要與 CK 比較，將相容的 rocm-libraries checkout 放在遠端，指定 composablekernel 路徑。
-目前本機 CK snapshot 取自 upstream develop 的 `2d3b6e98e4ef99cf7dccf54068f333c32a441348`。
+效能紀錄使用的 CK snapshot 取自 upstream develop 的 `2d3b6e98e4ef99cf7dccf54068f333c32a441348`。
 它只包含已提交的版本，不包含 rocm-libraries 工作目錄中的未提交修改。
 若保有本機 `reference/ck-bshd` snapshot，會隨工作目錄同步，且可省略 `CK_ROOT`。
 
@@ -53,7 +53,7 @@ bash scripts/remote.sh python3 benchmarks/bshd.py validate --output results/vali
 bash scripts/remote.sh python3 benchmarks/bshd.py bench --output results/bench.json
 ```
 
-在本次 A0 主機上，兩邊都以 `FAV4_ARCH=gfx1250-strict` 建置，並使用相容的
+在下述實測的 A0 主機上，兩邊都以 `FAV4_ARCH=gfx1250-strict` 建置，並使用相容的
 clang 24 與 HIP 7.16。可將以下環境變數傳給上述建置命令：
 
 ```bash
@@ -67,7 +67,7 @@ ELF 的 ISA，只將外層 HIP bundle selector 設為 runtime 回報的 `gfx1250
 並在 manifest 記錄兩者。`HIPCC` 應指向原始編譯器或單純設定路徑的 wrapper，
 不要另外包一層 strict bundle 轉換。一般 `gfx1250` 建置不經這個包裝流程。
 
-若使用 ROCm Python SDK（本次為 10.1.0），可直接使用其 `hipcc`。
+若使用 ROCm Python SDK（實測使用 10.1.0），可直接使用其 `hipcc`。
 若 benchmark 的 `ctypes` 找不到 `libamdhip64.so`，在遠端執行 benchmark 前設定：
 
 ```bash
@@ -87,7 +87,7 @@ Dense FLOPs 為 `4*B*H*D*S²`，causal 為 `4*B*H*D*S*(S+1)/2`。
 `results/` 可隨時刪除；建置 manifest 另存於 `build/`，benchmark 不依賴舊 results。
 刪除 `build/` 後先重新建置。遠端產物必須在下次同步前取回，`remote.sh` 會處理 `results/`。
 
-## 目前效能狀態
+## 效能紀錄
 
 Auto 在 Sq<128 使用 config 1，Sq≤2048 使用 config 132，較長 Q 使用 config 145。
 CK comparator 明確使用
@@ -97,13 +97,13 @@ Config 132/133 使用條件式 max 計算、延後合併分母、協作式初始
 以及 LDS 重排／非同步輸出。132 的工作群組順序針對短序列調整；145 在 133 上加入
 QK register allocation spacing。此配置對編譯器敏感，必須重新量測，不能視為 bank conflict 已解決。
 
-以下是 2026-11-08 更新 CK develop 後的實測：兩邊在新主機的同一張 gfx1250 A0
+以下數據對應本 repo 的程式版本 [`58716a2`](https://github.com/rocking5566/flash-attention-v4-rocm/commit/58716a2c1c580309b0444305cf61293d6cb575a8)。兩邊在同一張 gfx1250 A0
 （HIP_VISIBLE_DEVICES=2）重新建置與量測，BF16 BSHD、B32/H8/D128。
 CK revision 為 `2d3b6e98e4ef99cf7dccf54068f333c32a441348`；其 qr_tdm_sched
-pipeline 與 tile 設定相較上一份 snapshot 未變，相關 core headers 已隨 develop 更新。
+pipeline 與 tile 設定相較 CK `11c520d2147fab619a5a57e6d7c7368c6b41675b` 未變，相關 core headers 已更新。
 兩種起跑順序各六筆，每筆固定 warmup=5/repeat=20。TFLOPS 由每邊 12 筆觀察的平均時間計算，
 未剔除較慢或較快的樣本。兩邊使用相同 Q/K/V tensors，LSE 關閉，計時期間未啟用 profiler
-或額外的 amd-smi 查詢。本表不混用舊主機的量測。
+或額外的 amd-smi 查詢。所有數據來自該次同 GPU 比較。
 
 | S | Dense HIP / CK TFLOPS | 領先 | Causal HIP / CK TFLOPS | 領先 |
 |---:|---:|---:|---:|---:|
@@ -115,15 +115,16 @@ pipeline 與 tile 設定相較上一份 snapshot 未變，相關 core headers �
 | 16384 | 2050.29 / 1839.70 | 11.45% | 1975.01 / 1736.70 | 13.72% |
 | 32768 | 2059.20 / 1845.62 | 11.57% | 2009.50 / 1768.08 | 13.65% |
 
-本輪合併平均的 14 個 workload 全部超過 10%；反向起跑順序的 S1024／S4096 dense
+表中合併平均的 14 個 workload 全部超過 10%；反向起跑順序的 S1024／S4096 dense
 分別領先 8.96%／9.50%，不能解讀成每輪都保證超過 10%。
 8K–32K 的 dense／causal 在兩種順序都超過 10%。
-新版 CK 與 Auto 通過 112 項 BF16 正確性比較，包含 partial-sum guard 邊界與 overflow／mixed-row 案例；
+上述 CK 版本與 Auto 通過 112 項 BF16 正確性比較，包含 partial-sum guard 邊界與 overflow／mixed-row 案例；
 每個 benchmark 尺寸另檢查抽樣 rows 的 O 與 LSE，BF16 TDM stride／padding／zero-fill 也通過。
-數據、每筆樣本、source snapshot 與 build manifest 保存在未納入版控的 `results/ck-develop-20261108/`。
+數據、每筆樣本、source snapshot 與 build manifest 保存在未納入版控的 `results/`；
+manifest 的 source hashes 已核對與程式版本 `58716a2` 一致。
 
 兩邊使用 clang 24 `d6f6cb691863`、`gfx1250-strict` 與 HIP runtime 7.16.26385；
-本次環境為 ROCm Python SDK 10.1.0、PyTorch 2.14.0+rocm10.1.0。
+實測環境為 ROCm Python SDK 10.1.0、PyTorch 2.14.0+rocm10.1.0。
 A0 的一般 `gfx1250` 載入路徑會插入額外 TDM 等待，因此不能用不同 ISA target 或 runtime 的數字交叉比較。
 
 可用下列命令重測兩種順序，執行環境需使用與建置相容的 HIP/PyTorch：
@@ -137,8 +138,8 @@ python3 benchmarks/bshd.py bench --no-telemetry --order-phase 1 --output results
 `--min-speedup 1.10` 檢查的是該次執行的門檻；單一順序可能因主機狀態而未達標。
 效能與主機狀態有關，其他機器必須重新量測兩邊。
 
-前一輪（2026-11-06）的 8K dense ATT 由 rocprofv3 擷取並以 rcv-cli 分析，保留 raw trace、source 與 binary hashes。
-此次 CK develop 更新僅重跑正確性與效能，未重新擷取 ATT。
+程式版本 `58716a2` 的 8K dense ATT 由 rocprofv3 擷取並以 rcv-cli 分析，保留 raw trace、source 與 binary hashes。
+上述 CK 版本的比較僅重跑正確性與效能；ATT 沿用該程式版本的獨立擷取紀錄。
 64 個取樣 wave 沒有 `s_wait_idle`，非同步輸出 store 數量符合預期；剩餘 exposed attribution
 主要是 WMMA／softmax，不能將此歸因直接換算成 GPU 利用率或加速比。更多 TDM issuer 與較小
 IGLP 群組未帶來實測改善，已移除。分析產物在未納入版控的 `results/att-final/`。

@@ -1,9 +1,10 @@
 # gfx1250 BF16 Attention Forward 設計說明
 
-本文說明截至 2026-11-08 的實作，讀者不需要先讀 FlashAttention-4（FA4）論文。
-重點是：這個 kernel 算什麼、資料如何在 GPU 裡移動，以及目前保留了哪些優化。
+本文對應本 repo 的程式版本 [`58716a2`](https://github.com/rocking5566/flash-attention-v4-rocm/commit/58716a2c1c580309b0444305cf61293d6cb575a8)，讀者不需要先讀 FlashAttention-4（FA4）論文。
+文中的設計、支援範圍與優化均以該版本為準；效能比較另標明 CK commit。
+重點是：這個 kernel 算什麼、資料如何在 GPU 裡移動，以及該版本保留了哪些優化。
 
-目前這是一個針對 AMD gfx1250 的獨立 HIP kernel。它借用 FA4 的「有需要才修正
+這是一個針對 AMD gfx1250 的獨立 HIP kernel。它借用 FA4 的「有需要才修正
 softmax 累積值」概念，再配合 gfx1250 的資料搬運與矩陣指令。
 它尚未實作完整的 FA4 非同步架構，也不是原作者 CUDA kernel 的逐行移植。
 
@@ -36,7 +37,7 @@ Dense attention 可以看全部 K。Causal attention 只允許第 i 列 Q 看第
 
 Q/K/V/O 都使用連續的 **BSHD** 排列，四個字母代表：
 
-| 維度 | 意義 | 本次主要測試值 |
+| 維度 | 意義 | 效能測試值 |
 |---|---|---|
 | B | Batch，一次處理幾筆序列 | 32 |
 | S | Sequence length，序列有幾個位置 | 512–32768 |
@@ -55,7 +56,7 @@ Q/O 的 shape 是 `[B, Sq, H, 128]`，K/V 是 `[B, Sk, H, 128]`，Sq 和 Sk 可�
 可選擇額外輸出 FP32 的 LSE，shape 為 `[B, H, Sq]`。LSE 是每列
 `log(sum(exp(score)))`，記錄 softmax 的正規化資訊；單純產生 O 時可以不寫它。
 
-目前不支援 GQA、每筆不同長度的 varlen、paged KV、dropout、bias、sliding window
+該版本不支援 GQA、每筆不同長度的 varlen、paged KV、dropout、bias、sliding window
 或 backward。Q/K/V 的 head 數必須相同。完整的 pointer、對齊與 stream 契約見
 [公開介面](include/fav4_bshd.h)。
 
@@ -80,7 +81,7 @@ Dense 模式仍會計算所有 Q/K 配對；當 Sq、Sk 一起加倍時，主要
 | 名詞 | 在這個 kernel 裡的用途 |
 |---|---|
 | GPU 主記憶體 | 存放完整的 Q/K/V/O，容量大，但反覆讀寫成本高 |
-| LDS | 工作群組共用的片上暫存區，存放目前與下一塊 K/V |
+| LDS | 工作群組共用的片上暫存區，存放正在計算與預先載入的 K/V tiles |
 | 暫存器（register） | 計算時最直接使用的儲存空間，保留 Q、分數片段與 O 累積值 |
 | TDM | 依照描述好的尺寸與 stride，把資料非同步搬進 LDS 的硬體機制 |
 | WMMA | 一次做一小塊矩陣乘加的硬體指令，本實作用 BF16 乘法、FP32 累加 |
@@ -108,7 +109,7 @@ flowchart LR
 
 1. 決定自己負責哪個 batch、head，以及哪 128 列 Q。
 2. 將 Q 與第一塊 K/V 搬進 LDS，再把 Q 讀入暫存器。
-3. 預先搬下一塊 K/V，同時計算目前這塊的 QK 分數。
+3. 預先搬下一塊 K/V，同時計算已載入這塊的 QK 分數。
 4. 遮掉 causal 或尾端越界的分數，計算 exponential 權重與 softmax 分母。
 5. 用權重乘 V，把貢獻加進暫存器裡的 O。
 6. 換到下一塊 K/V，重複步驟 3–5。
@@ -138,7 +139,7 @@ w = 2^(z - base)
 ```
 
 `score` 已經包含 scale。這裡的 w 還沒有除以分母，所以可以大於 1。
-`base` 是目前的數值基準，後續不一定等於看過的最大分數。
+`base` 是計算時沿用的數值基準，後續不一定等於看過的最大分數。
 
 第一塊先找最大值作為 base。後續只有新最大值**超過 base + 8** 才更新基準。
 8 是底數 2 的單位，代表 `2^8 = 256` 倍，並不是刪除小權重或把 attention 截斷。
@@ -159,7 +160,7 @@ Config 132／145 還加上一個保守檢查，程式中稱為 guarded max：
 若有部分總和超過 256，才回頭找這一列的最大分數。
 總和超標不代表最大值一定超標，例如許多中等大小的權重也會讓總和變大；
 這時算完最大值仍可能維持舊 base。
-若確實要更新，就修正舊 O／分母，並在乘 V **之前**重新計算目前 tile 的權重。
+若確實要更新，就修正舊 O／分母，並在乘 V **之前**重新計算該 tile 的權重。
 暫時的 exponential overflow 也會進入這個檢查失敗的路徑。
 
 分支採 wave 層級的投票：有 lane 需要檢查，同一 wave 會一起進入該路徑，
@@ -178,7 +179,7 @@ guarded max 也分別檢查兩邊的部分和；它可能比較保守，但不�
 
 ### K/V 使用 LDS 雙緩衝
 
-K 和 V 各有兩份 LDS buffer。計算目前這份時，讓 TDM 把下一塊搬到另一份。
+K 和 V 各有兩份 LDS buffer。計算其中一份時，讓 TDM 把下一塊搬到另一份。
 可以想成桌上有兩個盤子：處理第一盤時先把下一盤準備好，再交替使用。
 
 主要配置的 K 每列保留 136 個 BF16 位置，V 每列保留 144 個，實際資料都是 128 個。
@@ -200,9 +201,9 @@ Config 132／145 啟動時由 4 個 wave 分別搬不同列的 Q/K/V，分攤第
 ### 在 LDS 與 WMMA 之間再做一層預取
 
 資料搬到 LDS 之後，還要讀入暫存器才能餵給 WMMA。程式以 32 列 K/V 為單位分段：
-算目前片段時，先讀下一個片段的 operand，也就是矩陣指令接下來要吃的輸入。
+算一個片段時，先讀下一個片段的 operand，也就是矩陣指令接下來要吃的輸入。
 
-目前排程還把幾個階段接起來：QK 尾段先讀第一份 V；最後一段「權重乘 V」之前，
+排程還把幾個階段接起來：QK 尾段先讀第一份 V；最後一段「權重乘 V」之前，
 等待下一塊 K/V 就緒並同步，再預讀下一塊 K 的第一份 operand。
 這讓部分讀取有機會藏在矩陣計算之後，而不是全部等到下一輪開頭才開始。
 
@@ -242,7 +243,7 @@ LSE 開關與 Q 是否完整分別產生對應版本，完整 tile 且不需要 
 ### 調整工作群組的處理順序
 
 不同 Q tile 會讀取相同 head 的 K/V。調整工作群組順序，有機會改善快取重用與負載分配。
-目前的索引重排以 8 個分組為基礎，考量 gfx1250 的 XCD（GPU 計算區塊）分布；
+索引重排以 8 個分組為基礎，考量 gfx1250 的 XCD（GPU 計算區塊）分布；
 這是工作索引的映射，不是把工作群組硬性綁定到某個 XCD。
 
 Dense 和 causal 使用不同順序；causal 優先安排後面的 Q tile，因為它們可以看到更多 K，
@@ -255,7 +256,7 @@ Config 145 在 QK 階段用空的 inline assembly 保留一小段、4 個 VGPR �
 這些值不參與 attention 算術；目的是影響 clang 分配暫存器及安排指令的方式。
 
 實測選用了這個版本，ATT 也觀察到與 config 133 不同的指令排程。
-但目前證據**不足以宣稱已修好 WMMA register bank conflict**。
+但該版本的分析證據**不足以宣稱已修好 WMMA register bank conflict**。
 它對編譯器敏感，換版後必須重新驗證與計時。
 
 ## 8. Auto 如何選配置？
@@ -270,7 +271,7 @@ Config 145 在 QK 階段用空的 inline assembly 保留一小段、4 個 VGPR �
 
 本文第 5–7 節的完整組合主要描述 132／145，不能假設 config 1 也有全部功能。
 程式另保留 2、3、25、133 供比較，它們不會由 Auto 自動選到。
-Auto 目前是簡單的固定規則，沒有根據 batch、head、Sk 或時脈動態搜尋最佳配置。
+Auto 使用簡單的固定規則，沒有根據 batch、head、Sk 或時脈動態搜尋最佳配置。
 
 ## 9. 和 FA4、CK 各是什麼關係？
 
@@ -278,7 +279,7 @@ Auto 目前是簡單的固定規則，沒有根據 batch、head、Sk 或時脈�
 |---|---|
 | 分塊、online softmax、不寫完整分數矩陣 | FlashAttention 系列的共同基礎 |
 | Conditional rescaling | 借用 FA4 概念，使用 8 個 base-2 units 的更新門檻 |
-| Guarded max、延後合併分母 | 本 repo 在目前 HIP 路徑上的具體實作與優化 |
+| Guarded max、延後合併分母 | 該版本 HIP 路徑上的具體實作與優化 |
 | TDM、WMMA、LDS transpose、IGLP、非同步輸出 | 針對 gfx1250 使用的硬體機制與排程 |
 | 完整 FA4 非同步 pipeline、TMEM、獨立 correction warpgroup | 尚未實作；後兩者也不是這份 HIP kernel 直接使用的 AMD 介面 |
 | CK | 可選的效能比較對象；部分底層描述與索引映射參考 CK，歸屬見 NOTICE |
@@ -296,16 +297,17 @@ Auto 目前是簡單的固定規則，沒有根據 batch、head、Sk 或時脈�
 ATT 像是查看部分 wave 的工作時間線，可以定位等待、計算與寫回的空檔；
 最終是否變快，仍以沒有開 profiler 的同 GPU 比較為準。
 
-2026-11-06 的 S8192 dense、config 145 ATT，以 rocprofv3 擷取、rcv-cli 分析。
+程式版本 `58716a2` 的 S8192 dense、config 145 ATT，以 rocprofv3 擷取、rcv-cli 分析。
 取樣的 64 個 wave 沒有 `s_wait_idle`，非同步輸出 store 數量也符合預期。
 仍可看到啟動搬運、迴圈／尾端 TDM 等待與最後輸出等待；分析中主要暴露成本歸屬於 WMMA 與 exp2。
 這只是局部指令追蹤，不能直接推算整張 GPU 的利用率，也不能把等待比例當成可達加速比。
 
 曾試過更小的 IGLP 分組，以及在主迴圈增加 TDM 發送 wave，正確性通過但計時較慢，
-因此目前未保留。這與現在「啟動時四個 wave 分攤載入」是不同的改動。
+因此該版本未保留。這與已採用的「啟動時四個 wave 分攤載入」是不同的改動。
 
-2026-11-08 更新 CK develop 至 `2d3b6e98e4ef99cf7dccf54068f333c32a441348` 後，
-在新主機的同一張 GPU 重建並比較兩邊；本輪沒有重新擷取 ATT。
+效能數據對應本 repo 程式版本 `58716a2`，比較對象為 CK develop
+`2d3b6e98e4ef99cf7dccf54068f333c32a441348`。兩邊在同一張 GPU 重建並比較，
+該組測試沒有重新擷取 ATT；上段 ATT 是同一程式版本的獨立分析紀錄。
 測試為 BF16 BSHD、B32/H8/D128、LSE 關閉，以 HIP graph／GPU events 計 kernel 時間。
 每筆 warmup=5、repeat=20，兩種起跑順序合計每邊 12 筆觀察，以平均時間計算 TFLOPS，
 不剔除樣本。兩邊使用相同 compiler、ISA target 與 runtime。
@@ -320,9 +322,9 @@ TFLOPS 計算 QK 與「權重乘 V」的有效乘加運算，不把 softmax 或�
 
 全 14 個 workload 的合併平均都超過 10% 領先；部分短序列在單一起跑順序仍低於 10%。
 上述優化是組合後的結果，不能把總加速單獨歸功於 conditional rescaling、IGLP 或某一條指令。
-完整尺寸表見 [README 的效能紀錄](README.md#目前效能狀態)，換機器或編譯器需要重測。
+完整尺寸表見 [README 的效能紀錄](README.md#效能紀錄)，換機器或編譯器需要重測。
 
-新版 CK 與 Auto 通過 112 項正確性比較，涵蓋非整塊尺寸、不同 Q/K 長度、causal、LSE，
+上述 CK 版本與 Auto 通過 112 項正確性比較，涵蓋非整塊尺寸、不同 Q/K 長度、causal、LSE，
 以及觸發 softmax 修正與 overflow 恢復路徑的資料。每個效能尺寸另比對抽樣列的 O／LSE。
 測試使用高精度參考計算檢查誤差，這部分不計時，也不表示 attention kernel 使用 FP64。
 
