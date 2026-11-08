@@ -14,8 +14,8 @@ struct Fav4Args {
 // heads. Positive finite scale, finite FP32 dot products and scaled logits.
 // Q/K/V/O must be device-resident, 16-byte aligned and non-overlapping.
 // The stream belongs to the calling device; no allocation or host synchronization.
-// config 0: Auto: 1 for sq<128; 155 for 128..512 and 1025..2048;
-// 132 for 513..1024; 150 for sq>2048.
+// config 0: Auto: 1 for sq<128; 155 for 128..512; 156 for 513..2048;
+// 150 for sq>2048. B32/H8 square S512/S2048 use the fixed-shape config 157.
 // config 1: M64/N64; 2: M128/N128; 3: M128/N64 sharing K/V across two Q tiles.
 // config 25: M128/N128, paired Q tiles, staged operands and conditional rescaling.
 // config 132/133: M128/N128, guarded max, half-row denominators, cooperative
@@ -23,5 +23,8 @@ struct Fav4Args {
 // retains the long-sequence grid order. 145 adds QK register-allocation spacing.
 // config 150/155: group PV by query fragment and prioritize matrix phases.
 // 150 extends 145; 155 extends the short-sequence grid order of 132.
+// config 156: 155 with an initial base from the first valid score; first-tile
+// overflow recovery remains active. 157 specializes this for B32/H8/Sq=Sk at
+// S512 or S2048, and rejects other shapes. Both preserve the runtime scale.
 extern "C" int fav4_bshd_forward(const Fav4Args*,int causal,int config,hipStream_t);
 extern "C" int fav4_bshd_select_config(const Fav4Args*);

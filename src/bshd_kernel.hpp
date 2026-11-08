@@ -48,16 +48,21 @@ __device__ __forceinline__ float swap16(float x) {
         0, __builtin_bit_cast(int, x), 0x76543210, 0xfedcba98, false, true));
 }
 
-template<class T,int QM,bool Causal,bool Pad,int Mode,int Waves=4,int NB=64,int SumStyle=0,bool FullQ=false,bool StoreLSE=true,int EpiMode=0,int StartupMode=0,int GridGroup=0,int RegPad=0>
+template<class T,int QM,bool Causal,bool Pad,int Mode,int Waves=4,int NB=64,int SumStyle=0,bool FullQ=false,bool StoreLSE=true,int EpiMode=0,int StartupMode=0,int GridGroup=0,int RegPad=0,int StaticS=0>
 __global__ __launch_bounds__(32*Waves) void bshd_kernel(Fav4Args a) {
     constexpr int BM=16*Waves*QM, BN=NB, Pitch=136, VP=144;
+    // The host dispatch checks this fixed B32/H8 square shape before launch.
+    // Runtime scale and tensor pointers are preserved.
+    if constexpr(StaticS) { a.sq=StaticS; a.sk=StaticS; a.heads=8; a.batch=32; }
+    const unsigned grid_x=StaticS ? (StaticS+BM-1)/BM : gridDim.x;
+    const unsigned grid_y=StaticS ? 256 : gridDim.y;
 
     __shared__ __align__(16) T ks[2][BN*Pitch],vs[2][BN*VP];
     const int heads=a.heads;
     auto tile_div=[&](unsigned x) {
-        return x/gridDim.x;
+        return x/grid_x;
     };
-    const int lane=threadIdx.x%32,wave=threadIdx.x/32,tiles=gridDim.x;
+    const int lane=threadIdx.x%32,wave=threadIdx.x/32,tiles=grid_x;
 
     int linear=blockIdx.x+tiles*blockIdx.y,bh,tile;
     { if constexpr(Causal) {
@@ -65,18 +70,18 @@ __global__ __launch_bounds__(32*Waves) void bshd_kernel(Fav4Args a) {
         bh=linear/per_batch*heads+within%heads;
         tile=tiles-1-within/heads;
     } else {
-        const int total=tiles*gridDim.y,xcd=linear%8;
+        const int total=tiles*grid_y,xcd=linear%8;
         linear=xcd*(total/8)+min(xcd,total%8)+linear/8;
         {bh=linear/tiles; tile=linear%tiles;}
     } }
     if constexpr(GridGroup>0) {
         // Whole batch/head rows per XCD, Q tiles traversed in bounded row groups.
         // This is a bijection when each XCD owns a multiple of GridGroup rows.
-        if(gridDim.y%(8*GridGroup)==0) {
+        if(grid_y%(8*GridGroup)==0) {
             const unsigned physical=blockIdx.x+tiles*blockIdx.y;
             const unsigned slot=physical/8, depth=slot/GridGroup;
             const unsigned chunk=tile_div(depth);
-            bh=(physical%8)*(gridDim.y/8)+chunk*GridGroup+slot%GridGroup;
+            bh=(physical%8)*(grid_y/8)+chunk*GridGroup+slot%GridGroup;
             tile=Causal ? tiles-1-(depth-chunk*tiles) : depth-chunk*tiles;
         }
     }
@@ -262,13 +267,25 @@ __global__ __launch_bounds__(32*Waves) void bshd_kernel(Fav4Args a) {
                     return total[0]+total[1];
                 };
                 float base=maxima[qm];
-                if(start==0) {base=local_max(s[qm]);maxima[qm]=base;}
+                if(start==0) {
+                    if constexpr(Mode&(1<<21)) {
+                        // Column zero exists for every valid row, including top-left causal.
+                        // Both half-waves choose its score and share the same initial base.
+                        const float first=s[qm][0][0];
+                        const float other=swap16(first);
+                        const float valid_first=lane<16 ? first : other;
+                        // The known finite score keeps at least one weight at 2^-8.
+                        // A larger score is handled by the guard before multiplying V.
+                        base=valid_first*scale2+8.f;
+                    } else base=local_max(s[qm]);
+                    maxima[qm]=base;
+                }
                 float sum=exponentiate(s[qm],base);
                 float row_sum=(Mode&8) ? sum : sum+swap16(sum);
 
                 // A nonnegative partial sum <= 2^8 proves each of its exp values <= 2^8.
                 // Only the slow path needs the logit maximum. Overflow also enters it.
-                if(start!=0 && __any(!(row_sum<=256.f))) {
+                if(((Mode&(1<<21)) || start!=0) && __any(!(row_sum<=256.f))) {
                     auto correct = [&](const auto& logits) {
                         const float candidate=fmaxf(base,local_max(logits));
                         const bool update=candidate>base+8.f;

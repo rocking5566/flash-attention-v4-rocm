@@ -88,6 +88,13 @@ def inputs(b,h,sq,sk,pattern='normal'):
         q.fill_(1);k.zero_();k[:,128:].fill_(shift)
         if pattern=='mixed_guard':
             q[:,0::4].zero_();q[:,1::4].fill_(0.5);q[:,2::4].fill_(-1)
+    elif pattern in ('first_low','first_high','mixed_first','late_after_first'):
+        # The initial base uses column zero. Exercise first-tile recovery and
+        # rows that recover differently, including causal row zero by itself.
+        q.fill_(1);k.zero_();k[:,0].fill_(16 if pattern=='first_high' else -16)
+        if pattern=='mixed_first':
+            q[:,0::3].fill_(-1);q[:,1::3].zero_()
+        if pattern=='late_after_first':k[:,128:].fill_(16)
     return q,k,v
 
 def reference(q,k,v,causal,rows):
@@ -116,9 +123,14 @@ def validate(runner,output,configs):
            (2,8,512,512,'normal'),(1,8,257,257,'sum_guard'),
            (1,8,257,257,'below_guard'),(1,8,257,257,'above_guard'),
            (32,8,257,257,'mixed_guard')]
+    # Exercise the actual fixed-shape Auto paths, as well as generic tiles above.
+    cases += [(32,8,n,n,pattern) for n in (512,2048)
+              for pattern in ('first_low','first_high','mixed_first','late_after_first')]
     result=[]
     for b,h,sq,sk,pattern in cases:
-        q,k,v=inputs(b,h,sq,sk,pattern);rows=torch.arange(sq,device='cuda')
+        q,k,v=inputs(b,h,sq,sk,pattern)
+        rows=(torch.arange(sq,device='cuda') if sq<=512 else
+              torch.tensor(sorted({0,1,15,16,31,63,64,127,128,129,255,sq//2,sq-1}),device='cuda'))
         o=torch.empty_like(q);lse=torch.empty((b,h,sq),device='cuda',dtype=torch.float32)
         for causal in (False,True):
             ref,ref_lse=reference(q,k,v,causal,rows)
@@ -126,7 +138,7 @@ def validate(runner,output,configs):
                 for with_lse in (False,True):
                     e=check(runner,q,k,v,o,lse if with_lse else None,causal,config,rows,ref,ref_lse)
                     result.append(dict(b=b,h=h,sq=sq,sk=sk,pattern=pattern,causal=causal,
-                        config=config,lse=with_lse,**e))
+                        config=config,lse=with_lse,reference_rows=rows.tolist(),**e))
         print(f'PASS BSHD b{b}h{h} {sq}x{sk} {pattern}',flush=True)
         output.write_text(json.dumps(result,indent=2)+'\n')
     print(f'PASS {len(result)} BF16 correctness comparisons (high-precision reference)',flush=True)
@@ -213,7 +225,7 @@ def main():
     p.add_argument('--config',type=int,default=0)
     p.add_argument('--causal',type=int,choices=[0,1],default=0,help='Mask for ATT capture')
     p.add_argument('--min-speedup',type=float,default=None)
-    p.add_argument('--validate-configs',default='-1,0,1,2,3,25,132,133,145')
+    p.add_argument('--validate-configs',default='-1,0,1,2,3,25,132,133,145,150,155,156')
     p.add_argument('--no-telemetry',action='store_true',help='Skip amd-smi clock/temperature/power/usage queries')
     p.add_argument('--order-phase',type=int,choices=[0,1],default=0)
     a=p.parse_args();a.output.parent.mkdir(parents=True,exist_ok=True)
