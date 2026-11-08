@@ -42,7 +42,8 @@ bash scripts/remote.sh bash scripts/build.sh
 ```
 
 要與 CK 比較，將相容的 rocm-libraries checkout 放在遠端，指定 composablekernel 路徑。
-已使用的 CK revision 為 `11c520d2147fab619a5a57e6d7c7368c6b41675b`。
+目前本機 CK snapshot 取自 upstream develop 的 `2d3b6e98e4ef99cf7dccf54068f333c32a441348`。
+它只包含已提交的版本，不包含 rocm-libraries 工作目錄中的未提交修改。
 若保有本機 `reference/ck-bshd` snapshot，會隨工作目錄同步，且可省略 `CK_ROOT`。
 
 ```bash
@@ -53,7 +54,7 @@ bash scripts/remote.sh python3 benchmarks/bshd.py bench --output results/bench.j
 ```
 
 在本次 A0 主機上，兩邊都以 `FAV4_ARCH=gfx1250-strict` 建置，並使用相容的
-clang 24、HIP 7.16 與 HSA 1.21。可將以下環境變數傳給上述建置命令：
+clang 24 與 HIP 7.16。可將以下環境變數傳給上述建置命令：
 
 ```bash
 FAV4_ARCH=gfx1250-strict HIPCC=/path/to/clang++ \
@@ -65,6 +66,13 @@ FAV4_ARCH=gfx1250-strict HIPCC=/path/to/clang++ \
 ELF 的 ISA，只將外層 HIP bundle selector 設為 runtime 回報的 `gfx1250`，
 並在 manifest 記錄兩者。`HIPCC` 應指向原始編譯器或單純設定路徑的 wrapper，
 不要另外包一層 strict bundle 轉換。一般 `gfx1250` 建置不經這個包裝流程。
+
+若使用 ROCm Python SDK（本次為 10.1.0），可直接使用其 `hipcc`。
+若 benchmark 的 `ctypes` 找不到 `libamdhip64.so`，在遠端執行 benchmark 前設定：
+
+```bash
+export LD_LIBRARY_PATH="$(python3 -m rocm_sdk path --root)/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+```
 
 BF16 正確性驗證涵蓋 causal、尾端、多 batch/head 和特殊 logits。
 高精度參考僅供檢查誤差，不計入 kernel 時間；kernel 輸入／輸出均為 BF16，累加與 softmax 為 FP32。
@@ -89,26 +97,33 @@ Config 132/133 使用條件式 max 計算、延後合併分母、協作式初始
 以及 LDS 重排／非同步輸出。132 的工作群組順序針對短序列調整；145 在 133 上加入
 QK register allocation spacing。此配置對編譯器敏感，必須重新量測，不能視為 bank conflict 已解決。
 
-以下是 2026-11-06 清理後 Auto 的實測：同一張 gfx1250 A0、BF16 BSHD、B32/H8/D128，
+以下是 2026-11-08 更新 CK develop 後的實測：兩邊在新主機的同一張 gfx1250 A0
+（HIP_VISIBLE_DEVICES=2）重新建置與量測，BF16 BSHD、B32/H8/D128。
+CK revision 為 `2d3b6e98e4ef99cf7dccf54068f333c32a441348`；其 qr_tdm_sched
+pipeline 與 tile 設定相較上一份 snapshot 未變，相關 core headers 已隨 develop 更新。
 兩種起跑順序各六筆，每筆固定 warmup=5/repeat=20。TFLOPS 由每邊 12 筆觀察的平均時間計算，
-未剔除較慢或較快的樣本。兩邊使用相同 Q/K/V tensors，LSE 關閉，計時期間未啟用 profiler。
+未剔除較慢或較快的樣本。兩邊使用相同 Q/K/V tensors，LSE 關閉，計時期間未啟用 profiler
+或額外的 amd-smi 查詢。本表不混用舊主機的量測。
 
 | S | Dense HIP / CK TFLOPS | 領先 | Causal HIP / CK TFLOPS | 領先 |
 |---:|---:|---:|---:|---:|
-| 512 | 1313 / 1189 | 10.46% | 798 / 694 | 15.02% |
-| 1024 | 1835 / 1642 | 11.70% | 1316 / 1119 | 17.54% |
-| 2048 | 1727 / 1547 | 11.65% | 1509 / 1279 | 17.95% |
-| 4096 | 1747 / 1576 | 10.84% | 1594 / 1366 | 16.74% |
-| 8192 | 1799 / 1627 | 10.58% | 1705 / 1487 | 14.62% |
-| 16384 | 1831 / 1652 | 10.82% | 1770 / 1554 | 13.85% |
-| 32768 | 1839 / 1658 | 10.87% | 1807 / 1590 | 13.65% |
+| 512 | 1632.81 / 1465.13 | 11.44% | 1037.94 / 863.79 | 20.16% |
+| 1024 | 1955.76 / 1770.86 | 10.44% | 1495.08 / 1236.90 | 20.87% |
+| 2048 | 1993.57 / 1783.72 | 11.76% | 1713.99 / 1441.07 | 18.94% |
+| 4096 | 1996.66 / 1795.26 | 11.22% | 1815.41 / 1545.73 | 17.45% |
+| 8192 | 2026.16 / 1827.64 | 10.86% | 1913.82 / 1671.33 | 14.51% |
+| 16384 | 2050.29 / 1839.70 | 11.45% | 1975.01 / 1736.70 | 13.72% |
+| 32768 | 2059.20 / 1845.62 | 11.57% | 2009.50 / 1768.08 | 13.65% |
 
-本輪合併平均的 14 個 workload 全部超過 10%；部分短序列在單一起跑順序仍低於 10%，
-不能解讀成每輪都保證此幅度。8K–32K 的 dense／causal 在兩種順序都超過 10%。
-Auto 與保留配置通過 504 項 BF16 正確性比較，包含 partial-sum guard 邊界與 overflow／mixed-row 案例。
-數據、每筆樣本、source snapshot 與 build manifest 保存在未納入版控的 `results/final-bshd/`。
+本輪合併平均的 14 個 workload 全部超過 10%；反向起跑順序的 S1024／S4096 dense
+分別領先 8.96%／9.50%，不能解讀成每輪都保證超過 10%。
+8K–32K 的 dense／causal 在兩種順序都超過 10%。
+新版 CK 與 Auto 通過 112 項 BF16 正確性比較，包含 partial-sum guard 邊界與 overflow／mixed-row 案例；
+每個 benchmark 尺寸另檢查抽樣 rows 的 O 與 LSE，BF16 TDM stride／padding／zero-fill 也通過。
+數據、每筆樣本、source snapshot 與 build manifest 保存在未納入版控的 `results/ck-develop-20261108/`。
 
-兩邊使用 clang 24 `d6f6cb691863`、`gfx1250-strict` 與 HIP runtime 7.16.26385。
+兩邊使用 clang 24 `d6f6cb691863`、`gfx1250-strict` 與 HIP runtime 7.16.26385；
+本次環境為 ROCm Python SDK 10.1.0、PyTorch 2.14.0+rocm10.1.0。
 A0 的一般 `gfx1250` 載入路徑會插入額外 TDM 等待，因此不能用不同 ISA target 或 runtime 的數字交叉比較。
 
 可用下列命令重測兩種順序，執行環境需使用與建置相容的 HIP/PyTorch：
@@ -122,7 +137,8 @@ python3 benchmarks/bshd.py bench --no-telemetry --order-phase 1 --output results
 `--min-speedup 1.10` 檢查的是該次執行的門檻；單一順序可能因主機狀態而未達標。
 效能與主機狀態有關，其他機器必須重新量測兩邊。
 
-最終 8K dense ATT 由 rocprofv3 擷取並以 rcv-cli 分析，保留 raw trace、source 與 binary hashes。
+前一輪（2026-11-06）的 8K dense ATT 由 rocprofv3 擷取並以 rcv-cli 分析，保留 raw trace、source 與 binary hashes。
+此次 CK develop 更新僅重跑正確性與效能，未重新擷取 ATT。
 64 個取樣 wave 沒有 `s_wait_idle`，非同步輸出 store 數量符合預期；剩餘 exposed attribution
 主要是 WMMA／softmax，不能將此歸因直接換算成 GPU 利用率或加速比。更多 TDM issuer 與較小
 IGLP 群組未帶來實測改善，已移除。分析產物在未納入版控的 `results/att-final/`。
