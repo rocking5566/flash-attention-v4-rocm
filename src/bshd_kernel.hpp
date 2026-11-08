@@ -122,6 +122,8 @@ __global__ __launch_bounds__(32*Waves) void bshd_kernel(Fav4Args a) {
     const float scale2=a.scale*1.4426950408889634f;
     V16<T> kc[8];
     int stage=0;
+    // Give matrix work priority while another resident wave can run softmax.
+    if constexpr(Mode&(1<<26)) __builtin_amdgcn_s_setprio(1);
     for(int start=0;start<end;start+=BN,stage^=1) {
         if(!(Mode&4096) || start==0) {
             if((wave==0)) gfx1250::wait();
@@ -210,6 +212,7 @@ __global__ __launch_bounds__(32*Waves) void bshd_kernel(Fav4Args a) {
         }
 
         if constexpr(RegPad) asm volatile("" : : "v"(reg_padding));
+        if constexpr(Mode&(1<<26)) __builtin_amdgcn_s_setprio(0);
         V16<T> p[QM][BN/32];
 #pragma unroll
         for(int qm=0;qm<QM;++qm) {
@@ -358,6 +361,7 @@ __global__ __launch_bounds__(32*Waves) void bshd_kernel(Fav4Args a) {
 
         }
 
+        if constexpr(Mode&(1<<26)) __builtin_amdgcn_s_setprio(1);
         if constexpr(Mode&1024) {
             V16<T> vc[8];
 #pragma unroll
@@ -382,10 +386,22 @@ __global__ __launch_bounds__(32*Waves) void bshd_kernel(Fav4Args a) {
                     }
 
                 {
+                if constexpr(Mode&(1<<25)) {
+                    // Keep each query fragment's PV instructions in one scheduling
+                    // region. The same P operand feeds all eight output fragments.
+                    // This is a compiler scheduling boundary, not a workgroup sync.
+#pragma unroll
+                    for(int qm=0;qm<QM;++qm) {
+#pragma unroll
+                        for(int d=0;d<8;++d) out[qm][d]=mma(vc[d],p[qm][t],out[qm][d]);
+                        __builtin_amdgcn_sched_barrier(0);
+                    }
+                } else {
 #pragma unroll
                 for(int d=0;d<8;++d) {
 #pragma unroll
                     for(int qm=0;qm<QM;++qm) out[qm][d]=mma(vc[d],p[qm][t],out[qm][d]);
+                }
                 }
                 }
                 if(t+1<BN/32 || (Mode&4096)) {
@@ -426,6 +442,7 @@ __global__ __launch_bounds__(32*Waves) void bshd_kernel(Fav4Args a) {
 
     }
 
+    if constexpr(Mode&(1<<26)) __builtin_amdgcn_s_setprio(0);
     if constexpr(EpiMode) {
         static_assert(BM<=BN);
         constexpr int OPitch=Pitch;

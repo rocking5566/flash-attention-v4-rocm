@@ -18,6 +18,8 @@ int launch(const Fav4Args& a,int config,hipStream_t stream) {
     case 132: launch_bshd<__bf16,Causal,2,1610768203,4,128,1,9,1,16>(a,stream); break;
     case 133: launch_bshd<__bf16,Causal,2,1610768203,4,128,1,9,1>(a,stream); break;
     case 145: launch_bshd<__bf16,Causal,2,1610768203,4,128,1,9,1,0,4>(a,stream); break;
+    case 150: launch_bshd<__bf16,Causal,2,1719820107,4,128,1,9,1,0,4>(a,stream); break;
+    case 155: launch_bshd<__bf16,Causal,2,1719820107,4,128,1,9,1,16,0>(a,stream); break;
     default: return hipErrorInvalidValue;
     }
     return hipGetLastError();
@@ -27,11 +29,13 @@ int launch(const Fav4Args& a,int config,hipStream_t stream) {
 extern "C" int fav4_bshd_select_config(const Fav4Args* a) {
     if(!a || a->sq<=0) return 0;
     if(a->sq<128) return 1;
-    return a->sq<=2048 ? 132 : 145;
+    // Keep the established schedule around S1024: its causal gain was not stable.
+    if(a->sq<=2048) return a->sq>512 && a->sq<=1024 ? 132 : 155;
+    return 150;
 }
 extern "C" int fav4_bshd_forward(const Fav4Args* a,int causal,int config,hipStream_t stream) {
     if(!a || !a->q || !a->k || !a->v || !a->o || a->batch<=0 || a->heads<=0 ||
-       a->sq<=0 || a->sk<=0 || (causal!=0 && causal!=1) || config<0 || config>145 ||
+       a->sq<=0 || a->sk<=0 || (causal!=0 && causal!=1) || config<0 || config>155 ||
        !std::isfinite(a->scale) || a->scale<=0) return hipErrorInvalidValue;
     if(a->batch>INT_MAX/a->heads || a->heads>INT_MAX/128 ||
        a->sq>INT_MAX/(a->heads*128) || a->sk>INT_MAX/(a->heads*128) ||

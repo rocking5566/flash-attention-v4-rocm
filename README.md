@@ -29,6 +29,10 @@ Q/K/V/O 為連續 `[B,S,H,128]`，可選 LSE 為 FP32 `[B,H,Sq]`。支援 equal 
 int status = fav4_bshd_forward(&args, causal, 0, stream); // config 0 = Auto
 ```
 
+Auto 依 Sq 選擇：小於 128 用 1，128–512／1025–2048 用 155，513–1024 用 132，
+大於 2048 用 150。150／155 將 PV 依 Q 片段分組，並在矩陣與 softmax 階段切換
+wave 優先序；155 保留短序列的工作群組順序。
+
 ## 建置與驗證
 
 依 `AGENTS.md`，在本機修改，在遠端編譯／測試。複製 `.remote.env.example` 為
@@ -89,7 +93,7 @@ Dense FLOPs 為 `4*B*H*D*S²`，causal 為 `4*B*H*D*S*(S+1)/2`。
 
 ## 效能紀錄
 
-Auto 在 Sq<128 使用 config 1，Sq≤2048 使用 config 132，較長 Q 使用 config 145。
+下表所用程式版本 `58716a2` 的 Auto：Sq<128 使用 config 1，Sq≤2048 使用 config 132，較長 Q 使用 config 145。
 CK comparator 明確使用
 `qr_tdm_sched` 的 D128、M128/N128、4-wave 配置，兩邊都啟用 expert scheduling。
 
