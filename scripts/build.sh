@@ -46,7 +46,9 @@ subprocess.run([cc,'--offload-arch=gfx1250','--offload-host-only',
     '-Xclang','-fcuda-include-gpubinary','-Xclang',str(fat),*common,'-o',str(output)],check=True)
 PY
 }
-compile_hip "${flags[@]}" -mllvm -amdgpu-expert-scheduling-mode "${candidate_flags[@]}" -shared src/bshd.hip -o build/libfav4_bshd.so >"$out/build-hip.log" 2>&1
+schedule_flags=(-mllvm -amdgpu-expert-scheduling-mode
+    -mllvm -amdgpu-sched-strategy=max-ilp -mllvm -amdgpu-barrier-signal-wait-latency=32)
+compile_hip "${flags[@]}" "${schedule_flags[@]}" "${candidate_flags[@]}" -shared src/bshd.hip -o build/libfav4_bshd.so >"$out/build-hip.log" 2>&1
 compile_hip "${flags[@]}" tests/bshd_tdm.hip -o build/bshd_tdm >"$out/build-tdm.log" 2>&1
 build/bshd_tdm >"$out/tdm-validation.log" 2>&1
 if [[ $BUILD_CK == --ck ]]; then
@@ -67,7 +69,8 @@ binaries=[Path('build/libfav4_bshd.so')]
 m=dict(compiler=subprocess.check_output([os.environ['HIPCC'],'--version'],text=True),
        compiler_command=os.environ['HIPCC'],offload_arch=os.environ['FAV4_ARCH'],
        hip_bundle_selector='gfx1250' if os.environ['FAV4_ARCH']=='gfx1250-strict' else os.environ['FAV4_ARCH'],
-       candidate_scheduling_flags='-mllvm -amdgpu-expert-scheduling-mode',
+       candidate_scheduling_flags='-mllvm -amdgpu-expert-scheduling-mode '
+           '-mllvm -amdgpu-sched-strategy=max-ilp -mllvm -amdgpu-barrier-signal-wait-latency=32',
        candidate_extra_flags=os.environ.get('FAV4_CXXFLAGS',''),
        source_sha256={str(p):sha(p) for p in files})
 if os.environ['BUILD_CK']=='--ck':

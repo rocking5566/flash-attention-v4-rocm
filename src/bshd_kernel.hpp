@@ -48,9 +48,13 @@ __device__ __forceinline__ float swap16(float x) {
         0, __builtin_bit_cast(int, x), 0x76543210, 0xfedcba98, false, true));
 }
 
-template<class T,int QM,bool Causal,bool Pad,int Mode,int Waves=4,int NB=64,int SumStyle=0,bool FullQ=false,bool StoreLSE=true,int EpiMode=0,int StartupMode=0,int GridGroup=0,int RegPad=0,int StaticS=0>
+template<class T,int QM,bool Causal,bool Pad,int Mode,int Waves=4,int NB=64,int SumStyle=0,bool FullQ=false,bool StoreLSE=true,int EpiMode=0,int StartupMode=0,int GridGroup=0,int RegPad=0,int StaticS=0,int LoopUnroll=1,bool PeelCausal=false,int QKPriority=1,int PVPriority=1,bool SetPVPriority=true>
 __global__ __launch_bounds__(32*Waves) void bshd_kernel(Fav4Args a) {
     constexpr int BM=16*Waves*QM, BN=NB, Pitch=136, VP=144;
+    static_assert(LoopUnroll>0);
+    static_assert(QKPriority>=0 && QKPriority<=3 && PVPriority>=0 && PVPriority<=3);
+    static_assert(SetPVPriority || PVPriority==0);
+    static_assert(!PeelCausal || (Causal && !Pad && BM==BN && StaticS>0 && StaticS%BN==0));
     // The host dispatch checks this fixed B32/H8 square shape before launch.
     // Runtime scale and tensor pointers are preserved.
     if constexpr(StaticS) { a.sq=StaticS; a.sk=StaticS; a.heads=8; a.batch=32; }
@@ -127,9 +131,10 @@ __global__ __launch_bounds__(32*Waves) void bshd_kernel(Fav4Args a) {
     const float scale2=a.scale*1.4426950408889634f;
     V16<T> kc[8];
     int stage=0;
-    // Give matrix work priority while another resident wave can run softmax.
-    if constexpr(Mode&(1<<26)) __builtin_amdgcn_s_setprio(1);
-    for(int start=0;start<end;start+=BN,stage^=1) {
+    // The fixed-shape path can favor QK over PV to improve overlap between waves.
+    // Softmax runs at priority zero; generic configurations keep both matrices at one.
+    if constexpr(Mode&(1<<26)) __builtin_amdgcn_s_setprio(QKPriority);
+    auto iteration=[&](auto mask_last,int start) __attribute__((always_inline)) {
         if(!(Mode&4096) || start==0) {
             if((wave==0)) gfx1250::wait();
             __syncthreads();
@@ -147,7 +152,10 @@ __global__ __launch_bounds__(32*Waves) void bshd_kernel(Fav4Args a) {
         // This is compiler-sensitive and must be checked with same-device timing.
         using Padding = float __attribute__((ext_vector_type(RegPad ? RegPad : 1)));
         Padding reg_padding;
+
+#if defined(__HIP_DEVICE_COMPILE__)
         if constexpr(RegPad) asm volatile("" : "=v"(reg_padding));
+#endif
         F8 s[QM][BN/16]={};
         if constexpr(Mode&512) {
             // Keep the next N32 slice live while the current slice executes.
@@ -216,13 +224,16 @@ __global__ __launch_bounds__(32*Waves) void bshd_kernel(Fav4Args a) {
             __builtin_amdgcn_sched_barrier(0);
         }
 
+
+#if defined(__HIP_DEVICE_COMPILE__)
         if constexpr(RegPad) asm volatile("" : : "v"(reg_padding));
+#endif
         if constexpr(Mode&(1<<26)) __builtin_amdgcn_s_setprio(0);
         V16<T> p[QM][BN/32];
 #pragma unroll
         for(int qm=0;qm<QM;++qm) {
             const int row=row0+qm*16*Waves;
-            if constexpr(Causal || Pad) {
+            if constexpr((Causal && decltype(mask_last)::value) || Pad) {
                 if((Pad && start+BN>a.sk) || (Causal && start+BN>tile*BM)) {
 #pragma unroll
                     for(int n=0;n<BN/16;++n) {
@@ -378,7 +389,7 @@ __global__ __launch_bounds__(32*Waves) void bshd_kernel(Fav4Args a) {
 
         }
 
-        if constexpr(Mode&(1<<26)) __builtin_amdgcn_s_setprio(1);
+        if constexpr((Mode&(1<<26)) && SetPVPriority) __builtin_amdgcn_s_setprio(PVPriority);
         if constexpr(Mode&1024) {
             V16<T> vc[8];
 #pragma unroll
@@ -457,7 +468,21 @@ __global__ __launch_bounds__(32*Waves) void bshd_kernel(Fav4Args a) {
         }
         }
 
+        if constexpr((Mode&(1<<26)) && QKPriority!=PVPriority)
+            __builtin_amdgcn_s_setprio(QKPriority);
+    };
+    if constexpr(PeelCausal) {
+        // For square, aligned M=N tiles, only the final K tile meets the diagonal.
+        // Keep its mask outside the unrolled prefix to shorten register lifetimes.
+        int start=0;
+#pragma unroll LoopUnroll
+        for(;start+BN<end;start+=BN,stage^=1) iteration(std::false_type{},start);
+        if(start<end) iteration(std::true_type{},start);
+    } else {
+#pragma unroll LoopUnroll
+        for(int start=0;start<end;start+=BN,stage^=1) iteration(std::true_type{},start);
     }
+
 
     if constexpr(Mode&(1<<26)) __builtin_amdgcn_s_setprio(0);
     if constexpr(EpiMode) {

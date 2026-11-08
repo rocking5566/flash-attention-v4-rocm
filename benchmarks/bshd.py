@@ -124,7 +124,7 @@ def validate(runner,output,configs):
            (1,8,257,257,'below_guard'),(1,8,257,257,'above_guard'),
            (32,8,257,257,'mixed_guard')]
     # Exercise the actual fixed-shape Auto paths, as well as generic tiles above.
-    cases += [(32,8,n,n,pattern) for n in (512,2048)
+    cases += [(32,8,n,n,pattern) for n in (512,1024,2048)
               for pattern in ('first_low','first_high','mixed_first','late_after_first')]
     result=[]
     for b,h,sq,sk,pattern in cases:
@@ -163,8 +163,9 @@ def benchmark(runner,output,seqs,config,order_phase,collect_telemetry=True):
         for causal in (False,True):
             ref,ref_lse=reference(q,k,v,causal,rows)
             graphs,warmups,outs,metrics={},{},{},{}
+            o=torch.empty_like(q)
             for vi in (config,-1):
-                o=torch.empty_like(q);outs[vi]=o
+                outs[vi]=o
                 lse=torch.empty((32,8,n),device='cuda',dtype=torch.float32)
                 metrics[vi]=dict(without_lse=check(runner,q,k,v,o,None,causal,vi,rows,ref,ref_lse),
                     with_lse=check(runner,q,k,v,o,lse,causal,vi,rows,ref,ref_lse))
@@ -241,7 +242,7 @@ def main():
         device=str(prop),hip_visible_devices=os.environ.get('HIP_VISIBLE_DEVICES'),torch=torch.__version__,
         hip_runtime_version=runtime_version.value,
         runtime_sha256={p:hashlib.sha256(Path(p).read_bytes()).hexdigest() for p in runtime_paths},
-        dtype='bf16',layout='BSHD',seed=11939,input_distribution='torch.randn BF16',
+        dtype='bf16',layout='BSHD',shared_timing_output=True,seed=11939,input_distribution='torch.randn BF16',
         order_phase=a.order_phase,telemetry_enabled=not a.no_telemetry,
         timing='Each observation: warmup=5, repeat=20 HIP graph nodes with GPU events; '
                'ABBA, BAAB, ABBA = 6 observations/kernel/shape/process; LSE off; warm cache; kernel only',
