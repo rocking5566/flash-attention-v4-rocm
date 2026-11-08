@@ -3,8 +3,9 @@
 獨立 HIP attention forward：**BF16、原生 BSHD、head dimension 128**。
 使用 FA4 conditional rescaling（threshold = 8 base-2 units）、native exp2、
 WMMA、TDM double buffering、LDS transpose、分段 operand 預取／IGLP 排程，
+PV 依 Q 片段分組、矩陣／softmax 階段的 wave 優先序切換，
 以及透過 LDS 重排後的非同步輸出寫回。尚未實作完整 FA4 非同步 pipeline、
-TMEM 或獨立 correction warpgroup。
+TMEM 或獨立 correction warpgroup。設計說明見 [DESIGN.md](DESIGN.md)。
 
 ## 程式結構
 
@@ -93,39 +94,41 @@ Dense FLOPs 為 `4*B*H*D*S²`，causal 為 `4*B*H*D*S*(S+1)/2`。
 
 ## 效能紀錄
 
-下表所用程式版本 `58716a2` 的 Auto：Sq<128 使用 config 1，Sq≤2048 使用 config 132，較長 Q 使用 config 145。
-CK comparator 明確使用
-`qr_tdm_sched` 的 D128、M128/N128、4-wave 配置，兩邊都啟用 expert scheduling。
+下表使用程式版本 `e45c742` 的 Auto：S512／S2048 使用 config 155，S1024 使用 132，
+S4096–32768 使用 150。CK comparator 明確使用 `qr_tdm_sched` 的
+D128、M128/N128、4-wave 配置，兩邊都啟用 expert scheduling。
 
 Config 132/133 使用條件式 max 計算、延後合併分母、協作式初始 TDM 載入，
 以及 LDS 重排／非同步輸出。132 的工作群組順序針對短序列調整；145 在 133 上加入
 QK register allocation spacing。此配置對編譯器敏感，必須重新量測，不能視為 bank conflict 已解決。
+150／155 分別在 145／132 上加入 PV 分組與 wave 優先序切換；S1024 causal 對新排程
+未量到穩定改善，因此 Auto 在 513–1024 區間保留 132。
 
-以下數據對應本 repo 的程式版本 [`58716a2`](https://github.com/rocking5566/flash-attention-v4-rocm/commit/58716a2c1c580309b0444305cf61293d6cb575a8)。兩邊在同一張 gfx1250 A0
-（HIP_VISIBLE_DEVICES=2）重新建置與量測，BF16 BSHD、B32/H8/D128。
-CK revision 為 `2d3b6e98e4ef99cf7dccf54068f333c32a441348`；其 qr_tdm_sched
-pipeline 與 tile 設定相較 CK `11c520d2147fab619a5a57e6d7c7368c6b41675b` 未變，相關 core headers 已更新。
+以下數據對應本 repo 的程式版本 [`e45c742`](https://github.com/rocking5566/flash-attention-v4-rocm/commit/e45c742e30999cfb7f2e324415052348ae38d539)。兩邊在同一張 gfx1250 A0
+（HIP_VISIBLE_DEVICES=2）量測，BF16 BSHD、B32/H8/D128。
+CK revision 為 `2d3b6e98e4ef99cf7dccf54068f333c32a441348`；整組優化實驗使用相同的 CK binary，
+下表的 CK 數據仍與 HIP 一起重新量測。
 兩種起跑順序各六筆，每筆固定 warmup=5/repeat=20。TFLOPS 由每邊 12 筆觀察的平均時間計算，
 未剔除較慢或較快的樣本。兩邊使用相同 Q/K/V tensors，LSE 關閉，計時期間未啟用 profiler
 或額外的 amd-smi 查詢。所有數據來自該次同 GPU 比較。
 
 | S | Dense HIP / CK TFLOPS | 領先 | Causal HIP / CK TFLOPS | 領先 |
 |---:|---:|---:|---:|---:|
-| 512 | 1632.81 / 1465.13 | 11.44% | 1037.94 / 863.79 | 20.16% |
-| 1024 | 1955.76 / 1770.86 | 10.44% | 1495.08 / 1236.90 | 20.87% |
-| 2048 | 1993.57 / 1783.72 | 11.76% | 1713.99 / 1441.07 | 18.94% |
-| 4096 | 1996.66 / 1795.26 | 11.22% | 1815.41 / 1545.73 | 17.45% |
-| 8192 | 2026.16 / 1827.64 | 10.86% | 1913.82 / 1671.33 | 14.51% |
-| 16384 | 2050.29 / 1839.70 | 11.45% | 1975.01 / 1736.70 | 13.72% |
-| 32768 | 2059.20 / 1845.62 | 11.57% | 2009.50 / 1768.08 | 13.65% |
+| 512 | 1637.00 / 1440.09 | 13.67% | 1074.74 / 863.51 | 24.46% |
+| 1024 | 1968.18 / 1772.98 | 11.01% | 1502.39 / 1236.61 | 21.49% |
+| 2048 | 2031.87 / 1774.04 | 14.53% | 1746.23 / 1441.73 | 21.12% |
+| 4096 | 2030.28 / 1789.87 | 13.43% | 1845.23 / 1543.58 | 19.54% |
+| 8192 | 2053.25 / 1831.16 | 12.13% | 1945.47 / 1669.23 | 16.55% |
+| 16384 | 2079.59 / 1839.98 | 13.02% | 2011.17 / 1738.82 | 15.66% |
+| 32768 | 2085.60 / 1845.76 | 12.99% | 2049.46 / 1768.63 | 15.88% |
 
-表中合併平均的 14 個 workload 全部超過 10%；反向起跑順序的 S1024／S4096 dense
-分別領先 8.96%／9.50%，不能解讀成每輪都保證超過 10%。
+表中合併平均的 **14 個 workload 全部超過 10%，其中 3 個超過 20%**；全面領先 20% 的目標尚未達成。
+反向起跑順序的 S1024 dense 領先 9.55%，不能解讀成每輪都保證超過 10%。
 8K–32K 的 dense／causal 在兩種順序都超過 10%。
-上述 CK 版本與 Auto 通過 112 項 BF16 正確性比較，包含 partial-sum guard 邊界與 overflow／mixed-row 案例；
-每個 benchmark 尺寸另檢查抽樣 rows 的 O 與 LSE，BF16 TDM stride／padding／zero-fill 也通過。
-數據、每筆樣本、source snapshot 與 build manifest 保存在未納入版控的 `results/`；
-manifest 的 source hashes 已核對與程式版本 `58716a2` 一致。
+上述 CK 版本、Auto 及明確指定的 config 150／155 通過 224 項 BF16 正確性比較，
+包含 partial-sum guard 邊界與 overflow／mixed-row 案例；每個 benchmark 尺寸另檢查抽樣 rows 的 O 與 LSE。
+數據、每筆樣本、實作差異與 build manifest 保存在未納入版控的 `results/opt20/accepted/`；
+manifest 的 source hashes 已核對與程式版本 `e45c742` 一致。
 
 兩邊使用 clang 24 `d6f6cb691863`、`gfx1250-strict` 與 HIP runtime 7.16.26385；
 實測環境為 ROCm Python SDK 10.1.0、PyTorch 2.14.0+rocm10.1.0。
@@ -142,11 +145,12 @@ python3 benchmarks/bshd.py bench --no-telemetry --order-phase 1 --output results
 `--min-speedup 1.10` 檢查的是該次執行的門檻；單一順序可能因主機狀態而未達標。
 效能與主機狀態有關，其他機器必須重新量測兩邊。
 
-程式版本 `58716a2` 的 8K dense ATT 由 rocprofv3 擷取並以 rcv-cli 分析，保留 raw trace、source 與 binary hashes。
-上述 CK 版本的比較僅重跑正確性與效能；ATT 沿用該程式版本的獨立擷取紀錄。
-64 個取樣 wave 沒有 `s_wait_idle`，非同步輸出 store 數量符合預期；剩餘 exposed attribution
-主要是 WMMA／softmax，不能將此歸因直接換算成 GPU 利用率或加速比。更多 TDM issuer 與較小
-IGLP 群組未帶來實測改善，已移除。分析產物在未納入版控的 `results/att-final/`。
+程式版本 `e45c742` 的 8K dense、config 150 ATT 由 rocprofv3 獨立擷取並以 rcv-cli 分析。
+SE0/CU1/SIMD0 的 64 個取樣 wave 無解碼錯誤，也沒有 `s_wait_idle`。
+相較基準 `58716a2` 的 config 145，主迴圈 barrier 的平均 attributed stall
+由 72.35 降至 7.60 cycles/hit；這是工具歸到該指令的局部等待成本，不能直接換算成 GPU 利用率或加速比。
+WMMA／exp2 仍有明顯成本，完整比較與限制見 [DESIGN.md](DESIGN.md#10-哪些改善有實測支持)。
+Raw trace、source／binary hashes 與分析保存在未納入版控的 `results/opt20/accepted/`。
 
 ## 演算法來源
 
