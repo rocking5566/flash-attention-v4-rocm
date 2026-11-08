@@ -16,7 +16,7 @@ using I8 = int32_t __attribute__((ext_vector_type(8)));
 template<int Rows, int CacheHint=0, int PadBytes=16, class T>
 __device__ __forceinline__ void load_strided(T* lds, const T* global,
                                             int remaining, uint32_t row_stride) {
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     static_assert(sizeof(T)==2);
     static_assert(PadBytes==16 || PadBytes==32);
     const uintptr_t addr=reinterpret_cast<uintptr_t>(global);
@@ -33,8 +33,30 @@ __device__ __forceinline__ void load_strided(T* lds, const T* global,
 #endif
 }
 
+// Keep store address operands live until every instruction in the burst has XACKed.
+// Same replay protection as CK's gfx1250 async store helper (MIT; see NOTICE).
+__device__ __forceinline__ void store_async_x8(const void* base,const uint32_t (&offset)[8],const uint32_t (&local)[8]) {
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
+    asm volatile(
+        "global_store_async_from_lds_b128 %0, %8, %16\n\t"
+        "global_store_async_from_lds_b128 %1, %9, %16\n\t"
+        "global_store_async_from_lds_b128 %2, %10, %16\n\t"
+        "global_store_async_from_lds_b128 %3, %11, %16\n\t"
+        "global_store_async_from_lds_b128 %4, %12, %16\n\t"
+        "global_store_async_from_lds_b128 %5, %13, %16\n\t"
+        "global_store_async_from_lds_b128 %6, %14, %16\n\t"
+        "global_store_async_from_lds_b128 %7, %15, %16\n\t"
+        "s_wait_xcnt 0"
+        :
+        : "v"(offset[0]), "v"(offset[1]), "v"(offset[2]), "v"(offset[3]), "v"(offset[4]), "v"(offset[5]), "v"(offset[6]), "v"(offset[7]),
+          "v"(local[0]), "v"(local[1]), "v"(local[2]), "v"(local[3]), "v"(local[4]), "v"(local[5]), "v"(local[6]), "v"(local[7]), "s"(base)
+        : "memory");
+#endif
+}
+
+
 __device__ __forceinline__ void wait() {
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     __builtin_amdgcn_s_wait_tensorcnt(0);
 #endif
 }
@@ -43,18 +65,12 @@ __device__ __forceinline__ void wait() {
 // contiguous vector at (lane%8, lane/8*8); output lane receives a column of 8.
 template<class T>
 __device__ __forceinline__ V8<T> transpose8(const T* lds) {
-#if defined(__gfx1250__)
-    if constexpr(std::is_same_v<T,__bf16>) {
-        using Native=__bf16 __attribute__((vector_size(16)));
-        using Pointer=__attribute__((address_space(3))) Native*;
-        auto p=(Pointer)(const_cast<T*>(lds));
-        return __builtin_bit_cast(V8<T>,__builtin_amdgcn_ds_load_tr16_b128_v8bf16(p));
-    } else {
-        using Native=__fp16 __attribute__((vector_size(16)));
-        using Pointer=__attribute__((address_space(3))) Native*;
-        auto p=(Pointer)(const_cast<T*>(lds));
-        return __builtin_bit_cast(V8<T>,__builtin_amdgcn_ds_load_tr16_b128_v8f16(p));
-    }
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
+    static_assert(std::is_same_v<T,__bf16>);
+    using Native=__bf16 __attribute__((vector_size(16)));
+    using Pointer=__attribute__((address_space(3))) Native*;
+    auto p=(Pointer)(const_cast<T*>(lds));
+    return __builtin_bit_cast(V8<T>,__builtin_amdgcn_ds_load_tr16_b128_v8bf16(p));
 #else
     return {};
 #endif

@@ -6,8 +6,8 @@
     std::fprintf(stderr,"%s: %s\n",#call,hipGetErrorString(e)); std::exit(1); } } while(0)
 
 template<int Pitch>
-__global__ void probe(const _Float16* input,_Float16* output,int rows,int heads,int head) {
-    __shared__ __align__(16) _Float16 tile[64*Pitch];
+__global__ void probe(const __bf16* input,__bf16* output,int rows,int heads,int head) {
+    __shared__ __align__(16) __bf16 tile[64*Pitch];
     if(threadIdx.x<32) {
         gfx1250::load_strided<64,0,(Pitch-128)*2>(tile,input+head*128,rows,heads*128);
         gfx1250::wait();
@@ -20,10 +20,10 @@ int main() {
     int failures=0;
     for(int pitch: {136,144}) for(int heads: {3,8,513}) for(int rows: {1,17,47,64}) {
         const int head=heads-1;
-        std::vector<_Float16> input(rows*heads*128),output(64*128);
+        std::vector<__bf16> input(rows*heads*128),output(64*128);
         for(int r=0;r<rows;++r) for(int h=0;h<heads;++h) for(int d=0;d<128;++d)
-            input[(r*heads+h)*128+d]=_Float16((r*137+h*71+d*13)%1021);
-        _Float16 *din,*dout;
+            input[(r*heads+h)*128+d]=__bf16((r*137+h*71+d*13)%1021);
+        __bf16 *din,*dout;
         HIP(hipMalloc(&din,input.size()*2)); HIP(hipMalloc(&dout,output.size()*2));
         HIP(hipMemcpy(din,input.data(),input.size()*2,hipMemcpyHostToDevice));
         if(pitch==136) probe<136><<<1,128>>>(din,dout,rows,heads,head);
@@ -39,7 +39,7 @@ int main() {
         }
         HIP(hipFree(din)); HIP(hipFree(dout));
     }
-    std::printf("BSHD TDM strided rows, head offset, padding and OOB zero-fill: %s (%d mismatches)\n",
+    std::printf("BSHD BF16 TDM load, strides, padding and zero-fill: %s (%d mismatches)\n",
                 failures ? "FAIL" : "PASS",failures);
     return failures ? 1 : 0;
 }

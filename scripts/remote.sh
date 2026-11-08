@@ -14,6 +14,15 @@ source .remote.env
     echo 'Refusing --delete sync outside the dedicated FAv4 directory' >&2; exit 2;
 }
 [[ $# -gt 0 ]] || { echo 'usage: scripts/remote.sh COMMAND [ARGS...]' >&2; exit 2; }
+# Recover an interrupted run before --delete can remove remote-only artifacts.
+if [[ -f build/pending-fetch ]]; then
+    mapfile -t pending <build/pending-fetch
+    if [[ ${pending[0]} == "$REMOTE_HOST" && ${pending[1]} == "$REMOTE_PATH" ]]; then
+        [[ ${pending[2]} == results/* ]] || exit 2
+        scp -o ConnectTimeout=10 -q -r "$REMOTE_HOST:$REMOTE_PATH/${pending[2]}" results/ || exit 1
+        rm build/pending-fetch
+    fi
+fi
 rsync -az --delete $RSYNC_EXCLUDES --exclude .remote.env ./ "$REMOTE_HOST:$REMOTE_PATH/"
 printf -v task_cmd '%q ' "$@"
 printf -v inner 'cd %q && %s' "$CONTAINER_PATH" "$task_cmd"
@@ -22,11 +31,11 @@ status=0
 ssh -o LogLevel=ERROR "$REMOTE_HOST" \
     "docker start $REMOTE_CONTAINER >/dev/null && docker exec -e HIP_VISIBLE_DEVICES=$HIP_VISIBLE_DEVICES $REMOTE_CONTAINER bash -lc $quoted_inner" || status=$?
 # results/ holds every generated artifact that should survive a future --delete.
-# Some GPU hosts do not expose an SFTP subsystem; try legacy SCP first.
+# Fall back to legacy SCP on hosts without an SFTP subsystem.
 fetch=${FAV4_FETCH:-results}
 [[ $fetch != none ]] || exit "$status"
 [[ $fetch == results || $fetch == results/* ]] || exit 2
 mkdir -p "$(dirname "$fetch")"
-scp -O -q -r "$REMOTE_HOST:$REMOTE_PATH/$fetch" "$(dirname "$fetch")/" ||
-    scp -q -r "$REMOTE_HOST:$REMOTE_PATH/$fetch" "$(dirname "$fetch")/" || status=1
+scp -q -r "$REMOTE_HOST:$REMOTE_PATH/$fetch" "$(dirname "$fetch")/" ||
+    scp -O -q -r "$REMOTE_HOST:$REMOTE_PATH/$fetch" "$(dirname "$fetch")/" || status=1
 exit "$status"

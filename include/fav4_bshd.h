@@ -14,7 +14,11 @@ struct Fav4Args {
 // heads. Positive finite scale, finite FP32 dot products and scaled logits.
 // Q/K/V/O must be device-resident, 16-byte aligned and non-overlapping.
 // The stream belongs to the calling device; no allocation or host synchronization.
-// config 0: fixed Auto (M128/N128 for sq>=128, otherwise M64/N64).
+// config 0: Auto (1 for sq<128, 132 for sq<=2048, 145 for longer Q).
 // config 1: M64/N64; 2: M128/N128; 3: M128/N64 sharing K/V across two Q tiles.
+// config 25: M128/N128, paired Q tiles, staged operands and conditional rescaling.
+// config 132/133: M128/N128, guarded max, half-row denominators, cooperative
+// startup and async LDS output stores. 132 groups batch/head rows by 16; 133
+// retains the long-sequence grid order. 145 adds QK register-allocation spacing.
 extern "C" int fav4_bshd_forward(const Fav4Args*,int causal,int config,hipStream_t);
 extern "C" int fav4_bshd_select_config(const Fav4Args*);
